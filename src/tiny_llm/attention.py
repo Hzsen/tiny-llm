@@ -1,3 +1,4 @@
+import math
 import mlx.core as mx
 from .basics import softmax, linear
 
@@ -9,7 +10,23 @@ def scaled_dot_product_attention_simple(
     scale: float | None = None,
     mask: mx.array | None = None,
 ) -> mx.array:
-    pass
+    # 1. Accquire Dimension(head_dim)
+    # query shape: (B, num_heads, L, D)意思是最后一个维度是D
+    D = query.shape[-1]
+    # 2. Calculate (1/sqrt(D))
+    if scale is None:
+        scale = 1.0 / (math.sqrt(D))
+    # 3. Calculate Scores = Q @ K^T * scale
+    # key的形状: (B, num_heads, S, D)，我们需要转置最后两个维度，目的是为了做矩阵乘法
+    scores = (query @ key.swapaxes(-1, -2)) * scale
+    # 4. Apply Mask (if provided)
+    if mask is not None:
+        scores = scores + mask
+    # 5. Apply Softmax to get Attention Weights
+    attn_weights = mx.softmax(scores, axis=-1)  # shape: (B, num_heads, L, S)
+    # 6. Compute Output = Attention Weights @ V
+    output = attn_weights @ value  # shape: (B, num_heads, L
+    return output
 
 
 class SimpleMultiHeadAttention:
@@ -22,7 +39,15 @@ class SimpleMultiHeadAttention:
         wv: mx.array,
         wo: mx.array,
     ):
-        pass
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        # 计算每个头的维度 D = hidden_size / num_heads
+        self.head_dim = hidden_size // num_heads
+        #保存线性变换权重
+        self.wq = wq
+        self.wk = wk
+        self.wv = wv
+        self.wo = wo
 
     def __call__(
         self,
@@ -31,7 +56,34 @@ class SimpleMultiHeadAttention:
         value: mx.array,
         mask: mx.array | None = None,
     ) -> mx.array:
-        pass
+        # 输入维度: (B, L, E)
+        # 1. 线性投影
+        # 此时形状： (B, L, hidden_size) -> (B, L, num_heads * head_dim)
+        # 这里的query,key,value可能来自于上一层，通常它们是同一个输入 x（self-attention）
+        q = linear(query, self.wq)  # shape: (B, L, hidden_size)
+        k = linear(key, self.wk)
+        v = linear(value, self.wv)
+        # 2. 拆分头
+        # Reshape and transpose to get (B, num_heads, L, head_dim)
+        B, L, _ = q.shape
+        q = q.reshape(B, L, self.num_heads, self.head_dim)
+        k = k.reshape(B, L, self.num_heads, self.head_dim)
+        v = v.reshape(B, L, self.num_heads, self.head_dim)
+        # Transpose to (B, num_heads, L, head_dim)
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+        # 3. 计算注意力
+        attn_output = scaled_dot_product_attention_simple(q, k, v, mask=mask)
+        # 4. 合并头
+        # Transpose back to (B, L, num_heads, head_dim)
+        attn_output = attn_output.transpose(0, 2, 1, 3)
+        # Reshape to (B, L, hidden_size)
+        attn_output = attn_output.reshape(B, L, self.hidden_size)
+        # 5. 最后的线性变换
+        output = linear(attn_output, self.wo)  # shape: (B, L, hidden_size)
+
+        return output
 
 
 def causal_mask(L: int, S: int, dtype: mx.Dtype) -> mx.array:
