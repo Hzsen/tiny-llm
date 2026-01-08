@@ -87,7 +87,24 @@ class SimpleMultiHeadAttention:
 
 
 def causal_mask(L: int, S: int, dtype: mx.Dtype) -> mx.array:
-    pass
+    # 1. 生成Key/Value的位置索引: （1，S）
+    # 含义是代表每一条信息的时间戳位置
+    S_indices = mx.arange(S)[None, :]  # shape: (1, S)
+
+    # 2. 生成Query的位置索引: (L, 1) 并进行“右对齐”修正
+    # 含义是代表当前查询的时间戳位置
+    # 核心逻辑(S - L): 模拟KV Cache机制下，Query位置相对于Key/Value位置的偏移
+    L_indices = mx.arange(L)[:, None] + (S - L)
+
+    # 3. 计算掩码矩阵: (L, S)
+    # 公式: mask[i, j] = 1 if j <= i + (S - L) else -inf
+    # 这里使用广播机制来实现比较操作
+    mask = mx.where(
+        S_indices > L_indices, -mx.inf, 0.0
+    )
+
+    # 4. 转换为指定的数据类型
+    return mask.astype(dtype)
 
 
 def scaled_dot_product_attention_grouped(
@@ -118,9 +135,18 @@ def scaled_dot_product_attention_grouped(
 
     #Calculate Scaled Dot-Product Attention
     scores = (query @ key.swapaxes(-1, -2)) * scale
-    if mask is not None:
+    # 情况 A: 用户传入了现成的 Mask 矩阵 (mx.array)
+    if isinstance(mask, mx.array):
         mask = mask.reshape(*batch, H_kv, n_repeats, L, S)
         scores = scores + mask
+
+    # 情况 B: 用户指定需要因果掩码 (str="causal")
+    # TinyLLM 课程中，有时候会传入字符串 "causal" 来指示函数内部自动生成掩码
+    elif mask == "causal":
+        # 调用刚才写好的函数
+        # 注意：这里生成的 mask 形状是 (L, S)，它会自动广播加到 (B, H, n, L, S) 上
+        c_mask = causal_mask(L, S, scores.dtype)
+        scores = scores + c_mask
     probs = mx.softmax(scores, axis=-1)
     output = probs @ value  # shape: (B, H_kv, n_repeats, L, D)
     # Reshape back to (B, H_q, L, D)
