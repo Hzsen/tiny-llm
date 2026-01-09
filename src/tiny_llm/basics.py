@@ -28,4 +28,4 @@ def linear(
 def silu(x: mx.array) -> mx.array:
     # SiLU (Sigmoid Linear Unit) 激活函数
     # 公式: x * sigmoid(x) = x / (1 + e^-x)
-    return x * mx.sigmoid(x)
+    return x / (1 + mx.exp(-x))

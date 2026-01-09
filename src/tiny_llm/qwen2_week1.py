@@ -7,7 +7,6 @@ from typing import Any
 from .embedding import Embedding
 from .quantize import dequantize_linear
 
-
 class Qwen2MultiHeadAttention:
     def __init__(
         self,
@@ -27,9 +26,15 @@ class Qwen2MultiHeadAttention:
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
+        
+        # 增加断言检查，这是好习惯
+        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
+        assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
+        
         self.head_dim = hidden_size // num_heads
-
-        # 保存线性变换权重和偏置
+        # [优化] 预先计算缩放因子，避免在 forward 中重复计算
+        self.scale = mx.rsqrt(self.head_dim)
+        
         self.wq = wq
         self.wk = wk
         self.wv = wv
@@ -37,58 +42,47 @@ class Qwen2MultiHeadAttention:
         self.bq = bq
         self.bk = bk
         self.bv = bv
-
-        #initialize RoPE
-        self.rope = RoPE(
-            dims=self.head_dim,
-            seq_len=max_seq_len,
-            base=theta,
-            traditional=False,
-        )
+        
+        # RoPE 初始化
+        self.rope = RoPE(self.head_dim, max_seq_len, theta)
 
     def __call__(
         self,
         x: mx.array,
         mask: mx.array | str | None = None,
     ) -> mx.array:
-        # 1.线性投影 Q,K,V（带偏置）
         B, L, _ = x.shape
-        q = linear(x, self.wq, self.bq)  # shape: (B, L, hidden_size)
-        k = linear(x, self.wk, self.bk)
-        v = linear(x, self.wv, self.bv)
-
-        # 2.Reshape and Transpose for Multi-Head Attention
-        q = q.reshape(B, L, self.num_heads, self.head_dim)
-        k = k.reshape(B, L, self.num_kv_heads, self.head_dim)
-        v = v.reshape(B, L, self.num_kv_heads, self.head_dim)
-
-        # 3. Apply RoPE to Q and K
-        q = self.rope(q, offset=slice(0, L))
-        k = self.rope(k, offset=slice(0, L))
-
-        # 4. Set up Attention using grouped attention function
-        q = q.transpose(0, 2, 1, 3)  # shape: (B, num_heads, L, head_dim)
-        k = k.transpose(0, 2, 1, 3)  # shape: (B, num_kv_heads, L, head_dim)
-        v = v.transpose(0, 2, 1, 3)  # shape: (B, num_kv_heads, L, head_dim)
-
-
-        # 5. Compute Attention Output and compel float32 output
-        output = scaled_dot_product_attention_grouped(
-            q.astype(mx.float32),
-            k.astype(mx.float32),
-            v.astype(mx.float32),
+        
+        # 1. 投影并直接 Reshape 分头
+        # linear 函数支持 bias 参数，这里直接传入比之前的先 linear 再加 bias 更高效
+        projection_q = linear(x, self.wq, bias=self.bq).reshape(B, L, self.num_heads, self.head_dim)
+        projection_k = linear(x, self.wk, bias=self.bk).reshape(B, L, self.num_kv_heads, self.head_dim)
+        projection_v = linear(x, self.wv, bias=self.bv).reshape(B, L, self.num_kv_heads, self.head_dim)
+        
+        # 2. 应用 RoPE
+        projection_q = self.rope(projection_q, offset=slice(0, L))
+        projection_k = self.rope(projection_k, offset=slice(0, L))
+        
+        # 3. Transpose 准备 Attention (B, H, L, D)
+        projection_q = projection_q.transpose(0, 2, 1, 3)
+        projection_k = projection_k.transpose(0, 2, 1, 3)
+        projection_v = projection_v.transpose(0, 2, 1, 3)
+        
+        # 4. 计算 Attention
+        # 强制 float32 精度，并传入 scale
+        x = scaled_dot_product_attention_grouped(
+            projection_q.astype(mx.float32),
+            projection_k.astype(mx.float32),
+            projection_v.astype(mx.float32),
+            scale=self.scale,
             mask=mask,
-        )
-
-        # 6. Rotate and reshape back
-        output = output.astype(x.dtype)
-        output = output.transpose(0, 2, 1, 3)
-        output = output.reshape(B, L, self.hidden_size)
-
-        # 7. Final linear projection
-        output = linear(output, self.wo)
-
-        return output
+        ).astype(x.dtype) # 转回原精度 (通常是 float16)
+        
+        # 5. Transpose 回来并 Reshape (Flatten)
+        x = x.transpose(0, 2, 1, 3).reshape(B, L, self.hidden_size)
+        
+        # 6. 输出投影
+        return linear(x, self.wo)
 
 
 class Qwen2MLP:
@@ -100,26 +94,15 @@ class Qwen2MLP:
         w_up: mx.array,
         w_down: mx.array,
     ):
+        self.dim = dim
+        self.hidden_dim = hidden_dim
         self.w_gate = w_gate
         self.w_up = w_up
         self.w_down = w_down
 
     def __call__(self, x: mx.array) -> mx.array:
-        # SwiGLU 实现:
-        # output = (SiLU(Gate(x)) * Up(x)) -> Down(...)
-        
-        gate = linear(x, self.w_gate)
-        up = linear(x, self.w_up)
-        
-        # SiLU 激活
-        act = silu(gate)
-        
-        # Element-wise 乘法
-        h = act * up
-        
-        # Down projection
-        output = linear(h, self.w_down)
-        return output
+        # 紧凑写法：(SiLU(Gate) * Up) -> Down
+        return linear(silu(linear(x, self.w_gate)) * linear(x, self.w_up), self.w_down)
 
 
 class Qwen2TransformerBlock:
@@ -145,53 +128,137 @@ class Qwen2TransformerBlock:
         max_seq_len: int = 32768,
         theta: int = 1000000,
     ):
-        # 初始化 Attention
+        self.num_attention_heads = num_attention_heads
+        self.hidden_size = hidden_size
+        
+        # 初始化各个子模块
+        self.mlp = Qwen2MLP(hidden_size, intermediate_size, w_gate, w_up, w_down)
+        
+        # RMSNorm 传入 weight (注意参数顺序匹配 layer_norm.py)
+        self.input_layernorm = RMSNorm(hidden_size, w_input_layernorm, eps=rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(hidden_size, w_post_attention_layernorm, eps=rms_norm_eps)
+        
         self.self_attn = Qwen2MultiHeadAttention(
-            hidden_size=hidden_size,
             num_heads=num_attention_heads,
+            hidden_size=hidden_size,
             num_kv_heads=num_kv_heads,
             wq=wq, wk=wk, wv=wv, wo=wo,
             bq=bq, bk=bk, bv=bv,
             max_seq_len=max_seq_len,
-            theta=theta
+            theta=theta,
         )
-        # 初始化 MLP
-        self.mlp = Qwen2MLP(
-            dim=hidden_size,
-            hidden_dim=intermediate_size,
-            w_gate=w_gate,
-            w_up=w_up,
-            w_down=w_down
-        )
-        # 初始化 RMSNorm
-        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.input_layernorm.weight = w_input_layernorm
-        
-        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.post_attention_layernorm.weight = w_post_attention_layernorm
 
     def __call__(
         self,
         x: mx.array,
         mask: mx.array | str | None = None,
     ) -> mx.array:
-        # 1. Self Attention (Pre-Norm)
-        # Residual connection: x + Attention(Norm(x))
-        h = x + self.self_attn(self.input_layernorm(x), mask=mask)
-        
-        # 2. MLP (Pre-Norm)
-        # Residual connection: h + MLP(Norm(h))
-        output = h + self.mlp(self.post_attention_layernorm(h))
-        
-        return output
+        # Pre-Norm 残差连接的标准写法
+        r = self.self_attn(self.input_layernorm(x), mask)
+        h = x + r
+        r = self.mlp(self.post_attention_layernorm(h))
+        out = h + r
+        return out
 
 
 class Qwen2ModelWeek1:
-    def __init__(self, mlx_model: Any):
-        self.model = mlx_model
+    def __init__(
+        self,
+        mlx_model: Any, # 这是一个加载好的 Qwen2 模型对象
+    ):
+        # 1. 提取配置参数
+        self.num_hidden_layers = mlx_model.args.num_hidden_layers
+        self.hidden_size = mlx_model.args.hidden_size
+        self.vocab_size = mlx_model.args.vocab_size
+        precision = mx.float16
+        self.precision = precision
+
+        # 2. 构建 Embedding 层 (提取权重并解量化)
+        # 注意：Embedding 权重通常是量化的，需要 dequantize
+        self.embedding = Embedding(
+            vocab_size=self.vocab_size,
+            embedding_dim=self.hidden_size,
+            weight=dequantize_linear(mlx_model.model.embed_tokens).astype(precision),
+        )
+        
+        # 3. 构建所有的 Transformer Layers
+        self.layers_inner = []
+        for i in range(mlx_model.args.num_hidden_layers):
+            # 繁琐但必要的一步：从原始模型中把每一层的权重都抠出来
+            # 并且使用 dequantize_linear 解量化成 float16
+            
+            # Attention 权重
+            wq = dequantize_linear(mlx_model.model.layers[i].self_attn.q_proj)
+            wk = dequantize_linear(mlx_model.model.layers[i].self_attn.k_proj)
+            wv = dequantize_linear(mlx_model.model.layers[i].self_attn.v_proj)
+            wo = dequantize_linear(mlx_model.model.layers[i].self_attn.o_proj)
+            
+            # MLP 权重
+            w_gate = dequantize_linear(mlx_model.model.layers[i].mlp.gate_proj)
+            w_up = dequantize_linear(mlx_model.model.layers[i].mlp.up_proj)
+            w_down = dequantize_linear(mlx_model.model.layers[i].mlp.down_proj)
+
+            # 实例化我们自己写的 Block
+            layer = Qwen2TransformerBlock(
+                num_attention_heads=mlx_model.args.num_attention_heads,
+                num_kv_heads=mlx_model.args.num_key_value_heads,
+                hidden_size=mlx_model.args.hidden_size,
+                intermediate_size=mlx_model.args.intermediate_size,
+                rms_norm_eps=mlx_model.args.rms_norm_eps,
+                # 传入解量化后的权重
+                wq=wq.astype(precision),
+                wk=wk.astype(precision),
+                wv=wv.astype(precision),
+                wo=wo.astype(precision),
+                # Bias 通常不量化，直接转类型
+                bq=mlx_model.model.layers[i].self_attn.q_proj.bias.astype(precision),
+                bk=mlx_model.model.layers[i].self_attn.k_proj.bias.astype(precision),
+                bv=mlx_model.model.layers[i].self_attn.v_proj.bias.astype(precision),
+                w_gate=w_gate.astype(precision),
+                w_up=w_up.astype(precision),
+                w_down=w_down.astype(precision),
+                # Norm 权重
+                w_input_layernorm=mlx_model.model.layers[i].input_layernorm.weight.astype(precision),
+                w_post_attention_layernorm=mlx_model.model.layers[i].post_attention_layernorm.weight.astype(precision),
+                max_seq_len=mlx_model.args.max_position_embeddings,
+                theta=mlx_model.args.rope_theta,
+            )
+            self.layers_inner.append(layer)
+
+        # 4. 构建 Final Norm
+        self.norm = RMSNorm(
+            mlx_model.args.hidden_size,
+            weight=mlx_model.model.norm.weight.astype(precision),
+            eps=mlx_model.args.rms_norm_eps,
+        )
+        
+        # 5. 处理 LM Head (输出层)
+        # 如果权重共享 (tie_word_embeddings=True)，则复用 Embedding 的权重
+        # 否则提取专门的 lm_head 权重
+        if not mlx_model.args.tie_word_embeddings:
+            self.w_lm_head = dequantize_linear(mlx_model.lm_head)
+        else:
+            self.w_lm_head = None # 标记为 None，后续用 embedding.as_linear 代替
+            
+        self.mlx_model = mlx_model
 
     def __call__(
         self,
         inputs: mx.array,
     ) -> mx.array:
-        pass
+        # 1. Embedding: Token IDs -> Vectors
+        h = self.embedding(inputs)
+        
+        # 2. Layers Loop
+        for layer in range(self.num_hidden_layers):
+            h = self.layers_inner[layer](h, mask="causal")
+            
+        # 3. Final Norm
+        h = self.norm(h)
+        
+        # 4. LM Head: Vectors -> Logits (Probabilities)
+        if self.w_lm_head is not None:
+            return linear(h, self.w_lm_head)
+        else:
+            # 使用 Embedding 权重转置来计算 Logits
+            return self.embedding.as_linear(h)
